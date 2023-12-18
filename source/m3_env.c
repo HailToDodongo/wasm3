@@ -181,11 +181,12 @@ IM3Runtime  m3_NewRuntime  (IM3Environment i_environment, u32 i_stackSizeInBytes
         runtime->environment = i_environment;
         runtime->userdata = i_userdata;
 
-        runtime->stack = m3_Malloc ("Wasm Stack", i_stackSizeInBytes + 4*sizeof (m3slot_t)); // TODO: more precise stack checks
+        runtime->originStack = m3_Malloc ("Wasm Stack", i_stackSizeInBytes + 4*sizeof (m3slot_t)); // TODO: more precise stack checks
 
-        if (runtime->stack)
+        if (runtime->originStack)
         {
-            runtime->numStackSlots = i_stackSizeInBytes / sizeof (m3slot_t);         m3log (runtime, "new stack: %p", runtime->stack);
+            runtime->stack = runtime->originStack;
+            runtime->numStackSlots = i_stackSizeInBytes / sizeof (m3slot_t);         m3log (runtime, "new stack: %p", runtime->originStack);
         }
         else m3_Free (runtime);
     }
@@ -233,7 +234,7 @@ void  Runtime_Release  (IM3Runtime i_runtime)
     Environment_ReleaseCodePages (i_runtime->environment, i_runtime->pagesOpen);
     Environment_ReleaseCodePages (i_runtime->environment, i_runtime->pagesFull);
 
-    m3_Free (i_runtime->stack);
+    m3_Free (i_runtime->originStack);
     m3_Free (i_runtime->memory.mallocated);
 }
 
@@ -297,8 +298,12 @@ M3Result  EvaluateExpression  (IM3Module i_module, void * o_expressed, u8 i_type
 
         if (not result)
         {
+# if (d_m3EnableOpProfiling || d_m3EnableOpTracing)
+            m3ret_t r = RunCode (m3code, stack, NULL, d_m3OpDefaultArgs, d_m3BaseCstr);
+# else
             m3ret_t r = RunCode (m3code, stack, NULL, d_m3OpDefaultArgs);
-
+# endif
+            
             if (r == 0)
             {                                                                               m3log (runtime, "expression result: %s", SPrintValue (stack, i_type));
                 if (SizeOfType (i_type) == sizeof (u32))
@@ -317,7 +322,7 @@ M3Result  EvaluateExpression  (IM3Module i_module, void * o_expressed, u8 i_type
     }
     else result = m3Err_mallocFailedCodePage;
 
-    runtime.stack = NULL;        // prevent free(stack) in ReleaseRuntime
+    runtime.originStack = NULL;        // prevent free(stack) in ReleaseRuntime
     Runtime_Release (& runtime);
     i_module->runtime = savedRuntime;
 
@@ -411,7 +416,7 @@ M3Result  InitGlobals  (IM3Module io_module)
     if (io_module->numGlobals)
     {
         // placing the globals in their structs isn't good for cache locality, but i don't really know what the global
-        // access patterns typcially look like yet.
+        // access patterns typically look like yet.
 
         //          io_module->globalMemory = m3Alloc (m3reg_t, io_module->numGlobals);
 
@@ -424,7 +429,8 @@ M3Result  InitGlobals  (IM3Module io_module)
                 if (g->initExpr)
                 {
                     bytes_t start = g->initExpr;
-                    result = EvaluateExpression (io_module, & g->intValue, g->type, & start, g->initExpr + g->initExprSize);
+
+                    result = EvaluateExpression (io_module, & g->i64Value, g->type, & start, g->initExpr + g->initExprSize);
 
                     if (not result)
                     {
@@ -567,7 +573,11 @@ _           (CompileFunction (function));
         startFunctionTmp = io_module->startFunction;
         io_module->startFunction = -1;
 
+# if (d_m3EnableOpProfiling || d_m3EnableOpTracing)
+        result = (M3Result) RunCode (function->compiled, (m3stack_t) runtime->stack, runtime->memory.mallocated, d_m3OpDefaultArgs, d_m3BaseCstr);
+# else
         result = (M3Result) RunCode (function->compiled, (m3stack_t) runtime->stack, runtime->memory.mallocated, d_m3OpDefaultArgs);
+# endif
 
         if (result)
         {
@@ -648,8 +658,8 @@ M3Result  m3_GetGlobal  (IM3Global                 i_global,
     if (not i_global) return m3Err_globalLookupFailed;
 
     switch (i_global->type) {
-    case c_m3Type_i32: o_value->value.i32 = i_global->intValue; break;
-    case c_m3Type_i64: o_value->value.i64 = i_global->intValue; break;
+    case c_m3Type_i32: o_value->value.i32 = i_global->i32Value; break;
+    case c_m3Type_i64: o_value->value.i64 = i_global->i64Value; break;
 # if d_m3HasFloat
     case c_m3Type_f32: o_value->value.f32 = i_global->f32Value; break;
     case c_m3Type_f64: o_value->value.f64 = i_global->f64Value; break;
@@ -665,13 +675,12 @@ M3Result  m3_SetGlobal  (IM3Global                 i_global,
                          const IM3TaggedValue      i_value)
 {
     if (not i_global) return m3Err_globalLookupFailed;
-    // TODO: if (not g->isMutable) return m3Err_globalNotMutable;
-
+    if (not i_global->isMutable) return m3Err_globalNotMutable;
     if (i_global->type != i_value->type) return m3Err_globalTypeMismatch;
 
     switch (i_value->type) {
-    case c_m3Type_i32: i_global->intValue = i_value->value.i32; break;
-    case c_m3Type_i64: i_global->intValue = i_value->value.i64; break;
+    case c_m3Type_i32: i_global->i32Value = i_value->value.i32; break;
+    case c_m3Type_i64: i_global->i64Value = i_value->value.i64; break;
 # if d_m3HasFloat
     case c_m3Type_f32: i_global->f32Value = i_value->value.f32; break;
     case c_m3Type_f64: i_global->f64Value = i_value->value.f64; break;
@@ -690,6 +699,16 @@ M3ValueType  m3_GetGlobalType  (IM3Global          i_global)
 
 void *  v_FindFunction  (IM3Module i_module, const char * const i_name)
 {
+
+    // Prefer exported functions
+    for (u32 i = 0; i < i_module->numFunctions; ++i)
+    {
+        IM3Function f = & i_module->functions [i];
+        if (f->export_name and strcmp (f->export_name, i_name) == 0)
+            return f;
+    }
+
+    // Search internal functions
     for (u32 i = 0; i < i_module->numFunctions; ++i)
     {
         IM3Function f = & i_module->functions [i];
@@ -739,6 +758,33 @@ _           (CompileFunction (function))
 
     return result;
 }
+
+
+M3Result  m3_GetTableFunction  (IM3Function * o_function, IM3Module i_module, uint32_t i_index)
+{
+    M3Result result = m3Err_none;
+
+    if (i_index >= i_module->table0Size)
+    {
+        _throw ("function index out of range");
+    }
+
+    IM3Function function = i_module->table0[i_index];
+
+    if (function)
+    {
+        if (not function->compiled)
+        {
+_           (CompileFunction (function))
+        }
+    }
+
+    * o_function = function;
+
+    _catch:
+    return result;
+}
+
 
 static
 M3Result checkStartFunction(IM3Module i_module)
@@ -835,6 +881,7 @@ M3Result  m3_CallVL  (IM3Function i_function, va_list i_args)
     IM3Runtime runtime = i_function->module->runtime;
     IM3FuncType ftype = i_function->funcType;
     M3Result result = m3Err_none;
+    u8* s = NULL;
 
     if (!i_function->compiled) {
         return m3Err_missingCompiledCode;
@@ -844,7 +891,11 @@ M3Result  m3_CallVL  (IM3Function i_function, va_list i_args)
     ClearBacktrace (runtime);
 # endif
 
-    u8* s = GetStackPointerForArgs (i_function);
+    m3StackCheckInit();
+
+_   (checkStartFunction(i_function->module))
+
+    s = GetStackPointerForArgs (i_function);
 
     for (u32 i = 0; i < ftype->numArgs; ++i)
     {
@@ -855,14 +906,15 @@ M3Result  m3_CallVL  (IM3Function i_function, va_list i_args)
         case c_m3Type_f32:  *(f32*)(s) = va_arg(i_args, f64);  s += 8; break; // f32 is passed as f64
         case c_m3Type_f64:  *(f64*)(s) = va_arg(i_args, f64);  s += 8; break;
 # endif
-        default: return "unknown argument type";
+        default: return m3Err_argumentTypeUnknown;
         }
     }
-    m3StackCheckInit();
 
-_   (checkStartFunction(i_function->module))
-
+# if (d_m3EnableOpProfiling || d_m3EnableOpTracing)
+    result = (M3Result) RunCode (i_function->compiled, (m3stack_t)(runtime->stack), runtime->memory.mallocated, d_m3OpDefaultArgs, d_m3BaseCstr);
+# else
     result = (M3Result) RunCode (i_function->compiled, (m3stack_t)(runtime->stack), runtime->memory.mallocated, d_m3OpDefaultArgs);
+# endif
     ReportNativeStackUsage ();
 
     runtime->lastCalled = result ? NULL : i_function;
@@ -875,6 +927,7 @@ M3Result  m3_Call  (IM3Function i_function, uint32_t i_argc, const void * i_argp
     IM3Runtime runtime = i_function->module->runtime;
     IM3FuncType ftype = i_function->funcType;
     M3Result result = m3Err_none;
+    u8* s = NULL;
 
     if (i_argc != ftype->numArgs) {
         return m3Err_argumentCountMismatch;
@@ -887,7 +940,11 @@ M3Result  m3_Call  (IM3Function i_function, uint32_t i_argc, const void * i_argp
     ClearBacktrace (runtime);
 # endif
 
-    u8* s = GetStackPointerForArgs (i_function);
+    m3StackCheckInit();
+
+_   (checkStartFunction(i_function->module))
+
+    s = GetStackPointerForArgs (i_function);
 
     for (u32 i = 0; i < ftype->numArgs; ++i)
     {
@@ -898,15 +955,16 @@ M3Result  m3_Call  (IM3Function i_function, uint32_t i_argc, const void * i_argp
         case c_m3Type_f32:  *(f32*)(s) = *(f32*)i_argptrs[i];  s += 8; break;
         case c_m3Type_f64:  *(f64*)(s) = *(f64*)i_argptrs[i];  s += 8; break;
 # endif
-        default: return "unknown argument type";
+        default: return m3Err_argumentTypeUnknown;
         }
     }
 
-    m3StackCheckInit();
-
-_   (checkStartFunction(i_function->module))
-
+# if (d_m3EnableOpProfiling || d_m3EnableOpTracing)
+    result = (M3Result) RunCode (i_function->compiled, (m3stack_t)(runtime->stack), runtime->memory.mallocated, d_m3OpDefaultArgs, d_m3BaseCstr);
+# else
     result = (M3Result) RunCode (i_function->compiled, (m3stack_t)(runtime->stack), runtime->memory.mallocated, d_m3OpDefaultArgs);
+# endif
+
     ReportNativeStackUsage ();
 
     runtime->lastCalled = result ? NULL : i_function;
@@ -919,6 +977,7 @@ M3Result  m3_CallArgv  (IM3Function i_function, uint32_t i_argc, const char * i_
     IM3FuncType ftype = i_function->funcType;
     IM3Runtime runtime = i_function->module->runtime;
     M3Result result = m3Err_none;
+    u8* s = NULL;
 
     if (i_argc != ftype->numArgs) {
         return m3Err_argumentCountMismatch;
@@ -931,7 +990,11 @@ M3Result  m3_CallArgv  (IM3Function i_function, uint32_t i_argc, const char * i_
     ClearBacktrace (runtime);
 # endif
 
-    u8* s = GetStackPointerForArgs (i_function);
+    m3StackCheckInit();
+
+_   (checkStartFunction(i_function->module))
+
+    s = GetStackPointerForArgs (i_function);
 
     for (u32 i = 0; i < ftype->numArgs; ++i)
     {
@@ -942,15 +1005,16 @@ M3Result  m3_CallArgv  (IM3Function i_function, uint32_t i_argc, const char * i_
         case c_m3Type_f32:  *(f32*)(s) = strtod(i_argv[i], NULL);       s += 8; break;  // strtof would be less portable
         case c_m3Type_f64:  *(f64*)(s) = strtod(i_argv[i], NULL);       s += 8; break;
 # endif
-        default: return "unknown argument type";
+        default: return m3Err_argumentTypeUnknown;
         }
     }
 
-    m3StackCheckInit();
-
-_   (checkStartFunction(i_function->module))
-
+# if (d_m3EnableOpProfiling || d_m3EnableOpTracing)
+    result = (M3Result) RunCode (i_function->compiled, (m3stack_t)(runtime->stack), runtime->memory.mallocated, d_m3OpDefaultArgs, d_m3BaseCstr);
+# else
     result = (M3Result) RunCode (i_function->compiled, (m3stack_t)(runtime->stack), runtime->memory.mallocated, d_m3OpDefaultArgs);
+# endif
+    
     ReportNativeStackUsage ();
 
     runtime->lastCalled = result ? NULL : i_function;
@@ -965,7 +1029,6 @@ _   (checkStartFunction(i_function->module))
 //    return (u8 *) ((ptr + 7) & ~7);
 //}
 
-
 M3Result  m3_GetResults  (IM3Function i_function, uint32_t i_retc, const void * o_retptrs[])
 {
     IM3FuncType ftype = i_function->funcType;
@@ -975,7 +1038,7 @@ M3Result  m3_GetResults  (IM3Function i_function, uint32_t i_retc, const void * 
         return m3Err_argumentCountMismatch;
     }
     if (i_function != runtime->lastCalled) {
-        return "function not called";
+        return m3Err_functionNotCalled;
     }
 
     u8* s = (u8*) runtime->stack;
@@ -1010,7 +1073,7 @@ M3Result  m3_GetResultsVL  (IM3Function i_function, va_list o_rets)
     IM3FuncType ftype = i_function->funcType;
 
     if (i_function != runtime->lastCalled) {
-        return "function not called";
+        return m3Err_functionNotCalled;
     }
 
     u8* s = (u8*) runtime->stack;
@@ -1023,11 +1086,54 @@ M3Result  m3_GetResultsVL  (IM3Function i_function, va_list o_rets)
         case c_m3Type_f32:  *va_arg(o_rets, f32*) = *(f32*)(s);  s += 8; break;
         case c_m3Type_f64:  *va_arg(o_rets, f64*) = *(f64*)(s);  s += 8; break;
 # endif
-        default: return "unknown argument type";
+        default: return m3Err_argumentTypeUnknown;
         }
     }
     return m3Err_none;
 }
+
+M3Result  m3_GetResultsBuffer (IM3Function i_function, size_t i_bufferSize, void * o_buffer)
+{
+    IM3FuncType ftype = i_function->funcType;
+    IM3Runtime runtime = i_function->module->runtime;
+
+    if (i_function != runtime->lastCalled) {
+        return m3Err_functionNotCalled;
+    }
+
+    if (o_buffer == NULL) {
+        return m3Err_functionResultNullPtr;
+    }
+
+    char * buffer = (char*)o_buffer;
+    char * bufferEnd = buffer + i_bufferSize;
+    u8* stack = (u8*) runtime->stack;
+
+    for (u32 i = 0; i < ftype->numRets; ++i)
+    {
+        u32 argSize = SizeOfType(d_FuncRetType(ftype, i));
+        
+        if ((buffer + argSize) > bufferEnd) {
+            return m3Err_argumentCountMismatch;
+        }
+
+        if (argSize == sizeof(u32)) {
+            *(u32*)buffer = *(u32*)(stack);
+        } else {
+            *(u64*)buffer = *(u64*)(stack);
+        }
+
+        stack += 8;
+        buffer += argSize;
+    }
+
+    if (buffer != bufferEnd) {
+        return m3Err_argumentCountMismatch;
+    }
+
+    return m3Err_none;
+}
+
 
 void  ReleaseCodePageNoTrack (IM3Runtime i_runtime, IM3CodePage i_codePage)
 {
